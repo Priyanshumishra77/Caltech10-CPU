@@ -1,0 +1,204 @@
+MODULE ALU
+TITLE 'Arithmetic Logic Unit (ALU)'
+
+
+" Description: This module implements the Accumulator, Status Register, and ALU
+" for the Caltech10 CPU.
+"
+" The accumulator is an 8-bit register. It is the source and destination for
+" single operand ALU instructions and one of the sources and the destination for
+" two operand ALU instructions.
+"
+" The status register is an 8-bit register that holds the resultant status from
+" an ALU operation. Not all status bits are affected by every ALU operation.
+" Unused status register bits are read as zero.
+"
+" The ALU performs all of the standard logic and arithmetic operations including
+" boolean operations, shifts and rotates, addition, subtraction, and comparison.
+"
+" The control signals required to perform various instructions are available in a
+" separate file named 'CPU Control Signals.xlsx' and are based on the instructions
+" provided in the Caltech10 CPU instruction set description.
+
+
+" Revision History:
+" 2/17/22   Garrett Knuf    Initial Revision
+" 2/17/22   Garrett Knuf    Implement Shift/Rotate Operations
+" 2/18/22   Garrett Knuf    Additional Documentation
+" 2/18/22   Garrett Knuf    Ensure all buses are declared and fix syntax errors
+" 2/19/22   Garrett Knuf    Add PopF control signal
+" 2/19/22   Garrett Knuf    Fix Bug with zero flags
+" 3/14/22   Garrett Knuf    Adjust equations for Flags7..Flags0
+" 3/17/22   Garrett Knuf    Update comments
+
+
+ALU INTERFACE  (Data7..Data0,
+                UpdateAcc, SelectBlock, F3..F0, UseAdder, CarryInA, CarryInB,
+                SZFlags, VCFlags, InvertCarry, PopF, SRLowSelA, SRLowSelB,
+                SRMidSel, SRHighSelA, SRHighSelB, SRHighSelC,
+                Reset, Clock
+                -> Accum7..Accum0, Flags7..Flags0);
+
+
+" Pins/Signal Declarations
+
+Data7..Data0	pin;
+Accum7..Accum0	pin		ISTYPE 'REG';
+Flags7..Flags0	pin;
+
+UpdateAcc		pin;	" allows accum to change
+SelectBlock		pin;	" picks result from adder(1) or shifter(0)
+F3..F0 			pin;	" 4 control signals into F-block
+UseAdder		pin;	" passes f-block through adder when low
+CarryInA		pin;	" select pinA for 2:1 mux for selecting carry-in
+CarryInB		pin;	" select pinB for 2:1 mux for selecting carry-in
+SZFlags         pin;    " allows sign and zero flags to change
+VCFlags         pin;    " allows overflow and carry flags to change
+InvertCarry     pin;    " invert carry flag if subtracting
+PopF            pin;    " enables direct setting of flags
+SRLowSelA       pin;    " select pins for 4:1 mux to find low bit of shift/rot
+SRLowSelB       pin;    "
+SRMidSel        pin;    " select pins for 2:1 mux to find middle bits of
+                        " shift/rot
+SRHighSelA      pin;    " select pins for 5:1 mux
+SRHighSelB      pin;    "
+SRHighSelC      pin;    "
+
+Reset			pin;    " system reset
+Clock 		    pin;    " system clock
+
+
+" Intermediate Terms
+
+Fblock7..Fblock0        node;   " output from F-block
+CarryInLowBit           node;   " carry-in value for low-bit of adder
+Sum7..Sum0			    node;   " sum from adder
+Result7..Result0        node;   " result selected from either adder or 
+                                " shift/rot
+CarryOut7..CarryOut0    node;   " carry-out bits from adder
+CarryIn7..CarryIn0      node;   " carry-in bit from adder
+ShiftRot7..ShiftRot0    node;   " result from shifter/rotater
+CFlag                   node;   " carry flag
+VFlag                   node;   " overflow flag
+SFlag                   node;   " sign flag
+ZFlag                   node;   " zero flag
+Flag7                   node;   " unused flags
+Flag6                   node;
+Flag5                   node;
+Flag4                   node;
+
+
+" Declare Buses
+
+Data        =  [Data7..Data0];
+Accum       =  [Accum7..Accum0];
+Flags       =  [Flags7..Flags0];
+
+Fblock      =  [Fblock7..Fblock0];
+Sum         =  [Sum7..Sum0];
+Result      =  [Result7..Result0];
+CarryOut    =  [CarryOut7..CarryOut0];
+CarryIn     =  [CarryIn7..CarryIn0];
+ShiftRot    =  [ShiftRot7..ShiftRot0];
+
+
+
+EQUATIONS
+
+" Clocks for the outputs
+Accum.CLK  =  Clock;
+Flags.CLK  =  Clock;
+
+" Reset the outputs
+" Accum.CLR = Reset;
+" Flags.CLR = Reset;
+
+
+" F-block Operations
+
+" The F-block performs logical operations and is implemented in 4:1 mux
+" Uses F3..F0 as inputs and its select lines are Accum and Data
+Fblock  =  (!Accum & !Data & F0) # (!Accum & Data & F1) #
+           (Accum & !Data & F2) # (Accum & Data & F3);
+
+
+" Adder Operations
+
+" Select carry-in value for low-bit of adder implemented in 4:1 mux
+"   Possible values: (0, !CarryFlag, CarryFlag, or 1)
+CarryInLowBit  =  (!CarryInA & CarryInB & !Flags3) #
+                  (CarryInA & !CarryInB & Flags3) #
+                  (CarryInA & CarryInB);
+
+" The carry-out from the nth bit will be the carry-in for the (n+1)th bit
+" and will be zero if the adder is not being used
+CarryOut  =  ((Accum & UseAdder) & Fblock) #
+             (CarryIn & ((Accum & UseAdder) $ Fblock));
+
+" The carry-in for the nth bit will be the carry out from the (n-1)th bit
+" The lowest-order bit depends on control signals so it was calculated above
+CarryIn  =  [CarryOut6..CarryOut0, CarryInLowBit];
+
+" Result from adder using the accumulator and the F-Block as operands
+" !UseAdder sets one operand to 0, allowing F-Block to pass through adder
+Sum  =  (Accum & UseAdder) $ Fblock $ CarryIn;
+
+
+" Shifter/Rotater Operations (flag operations for block are not implemented yet)
+
+" Highest-order bit has the following possible values:
+"   remain the same, lowest-order bit, bit below, zero, or carry flag
+ShiftRot7  =  (!SRHighSelA & !SRHighSelB & SRHighSelC & Accum7) #
+              (!SRHighSelA & SRHighSelB & !SRHighSelC & Accum6) #
+              (!SRHighSelA & SRHighSelB & SRHighSelC & Accum0) #
+              (SRHighSelA & !SRHighSelB & !SRHighSelC & CFlag);
+
+" Middle-bits become either the bit to the left or the right
+ShiftRot[6..1]  =  (!SRMidSel & Accum[7..2]) # (SRMidSel & Accum[5..0]);
+
+" Lowest-order bit has the following possible values:
+"   highest-order bit, bit above, zero, or carry flag
+ShiftRot0  =  (!SRLowSelA & SRLowSelB & Flags3) #
+              (SRLowSelA & !SRLowSelB & Accum1) #
+              (SRLowSelA & SRLowSelB & Accum7);
+
+
+" Determine if result is from adder block or shift/rotater block
+Result  =  (SelectBlock & Sum) # (!SelectBlock & ShiftRot);
+
+
+" Flag Operations (not implemented for shift/rot)
+
+CFlag  =  (PopF & Data3) # (!PopF & SelectBlock & ((VCFlags &
+          ((!InvertCarry & CarryOut7) # (InvertCarry & !CarryOut7))) #
+          (!VCFlags & Flags3)));
+
+VFlag  =  (PopF & Data2) # (!PopF & SelectBlock & ((VCFlags &
+          ((UseAdder & Accum7 & Fblock7 & !Result7) #
+          (UseAdder & !Accum7 & !Fblock7 & Result7))) # (!VCFlags & Flags2)));
+
+SFlag  =  (PopF & Data1) # (!PopF & ((SZFlags & Result7) #
+          (!SZFlags & Flags1)));
+
+ZFlag  =  (PopF & Data0) # (!PopF & ((SZFlags & !Result7 & !Result6 & !Result5
+           & !Result4 & !Result3 & !Result2 & !Result1 & !Result0) #
+          (!SZFlags & Flags0)));
+
+
+" Flags7-Flags4 will only update when the flags are being popped
+" Flags6 and Flags4 do not retain status since they are unused
+Flag7 = (PopF & Data7) # (!PopF & Flags7);
+Flag6 = (PopF & Data6);
+Flag5 = (PopF & Data5) # (!PopF & Flags5);
+Flag4 = (PopF & Data4);
+
+" The four highest-order bits are unused (default zero)
+" The flags are inverted on the LEDs
+Flags  :=  [Flag7, Flag6, Flag5, Flag4, CFlag, VFlag, SFlag, ZFlag];
+
+
+" Update accumulator only if neccessary
+Accum  :=  (UpdateAcc & Result) # (!UpdateAcc & Accum);
+
+
+END

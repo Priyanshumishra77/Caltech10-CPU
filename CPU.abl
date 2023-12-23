@@ -1,0 +1,255 @@
+MODULE      CPU
+TITLE      'Caltech10 CPU'
+
+" CPU       DEVICE 'ispMACH4256V CPLD'
+
+" Description:  This is the top-level module which will instantiate and connect
+"               all modules for the Caltech10 CPU. The design is an 8-bit
+"               Harvard-architecture, accumulator-based CPU. It has an 8K x 16
+"               program memory space, a 256 x 8 memory space, and a 256 x 8
+"               input/output space. The CPU has an 8-bit accumulator, two 8-bit
+"               data addressing registers (X and S) and a 13-bit program counter.
+"               All instructions are a single 16-bit word and almost all
+"               instructions execute in a single clock cycle.
+"
+" Inputs:         ProgramDB[15..0]  - the 16-bit program data bus
+"                 Reset             - system reset signal
+"                 Clock             - system clock
+"
+" I/O:            DataDB[7..0]      - the 8-bit data data bus
+"
+" Outputs:        ProgramAB[12..0]  - the 13-bit program address bus
+"                 DataAB[7..0]      - the 8-bit data address bus
+"                 RD                - read signal for the data data bus
+"                 WR                - write signal for the data data bus
+"                 IO                - memory (0) or I/O (1) is being accessed
+"
+" Status Outputs: Accum[7..0]       - the 8-bit accumulator
+"                 Flags[7..0]       - the 8-bit flag register
+"                 XReg[7..0]        - the 8-bit X register
+"                 SReg[7..0]        - the 8-bit S register
+
+
+" Revision History:
+" 02/15/18   Glen George   Initial revision
+" 01/05/21   Glen George   Updated comments
+" 03/08/22   Garrett Knuf  Add interfaces
+" 03/09/22   Garrett Knuf  Implement equations and update documentation
+" 03/12/22   Garrett Knuf  Modify CU Interface (add AUOffset)
+" 03/14/22   Garrett Knuf  Change equations for unused flags (Flags6 and Flags4)
+
+
+" Pin/Signal Declarations
+
+" Inputs
+ProgramDB15..ProgramDB0	pin;	"input  16-bit instruction data bus
+Reset           	      pin;	"input  system reset signal
+Clock           	      pin;	"input  system clock
+
+" I/O
+DataDB7..DataDB0	pin;	"I/O  8-bit Data data bus
+
+" Outputs
+ProgramAB12..ProgramAB0	 pin;	"output  the 13-bit Program address bus
+DataAB7..DataAB0	       pin;	"output  the 8-bit Data address bus
+RD			                 pin;	"output  read signal for the Data data bus
+WR			                 pin;	"output  write signal for the Data data bus
+IO			                 pin;	"output  accessing memory (0) or I/O (1)
+
+" Debugging/Status Outputs
+Accum7..Accum0		pin;	"the 8-bit accumulator
+Flags7..Flags0		pin;	"the flags (8 bits)
+XReg7..XReg0	   	pin;	"the 8-bit X register
+SReg7..SReg0		  pin;	"the 8-bit S register
+
+
+" declare the used modules
+ALU INTERFACE  (Data7..Data0,
+                UpdateAcc, SelectBlock, F3..F0, UseAdder, CarryInA, CarryInB,
+                SZFlags, VCFlags, InvertCarry, PopF, SRLowSelA, SRLowSelB,
+                SRMidSel, SRHighSelA, SRHighSelB, SRHighSelC,
+                Reset, Clock
+                -> Accum7..Accum0, Flags7..Flags0);
+
+ProgramAccess INTERFACE (Offset7..Offset0, Direct12..Direct0,
+               	Load, SourceSelA, SourceSelB, SourceSelC, HoldPC,
+               	Reset, Clock
+               	-> ProgAddr12..ProgAddr0, PC12..PC0);
+
+DataAccess INTERFACE  (Accum7..Accum0, Offset7..Offset0,
+                IDSel, IDEn, PrePostSel, AddrSrcSelA, AddrSrcSelB,
+                OffsetSrcSel, UpdateX, UpdateS,
+                Reset, Clock
+                -> DataAddr7..DataAddr0, XReg7..XReg0, SReg7..SReg0);
+
+ CU INTERFACE (ProgramDB15..ProgramDB0, Flags7..Flags0, Reset, Clock
+                -> UpdateAcc, SelectBlock, F3..F0, UseAdder, CarryInA, CarryInB,
+                SZFlags, VCFlags, InvertC, PopF, Load, SourceSelA, SourceSelB,
+                SourceSelC, HoldPC, IDSel, IDEn, PrePostSel, AddrSrcSelA,
+                AddrSrcSelB, OffsetSrcSel, UpdateX, UpdateS, PAUOffsetSel,
+                DDBSelA, DDBSelB, RD, WR, IO, AUOffset12..AUOffset0);
+
+
+" create instances of the modules
+ALUnit    FUNCTIONAL_BLOCK  ALU;
+PAUnit    FUNCTIONAL_BLOCK  ProgramAccess;
+DAUnit    FUNCTIONAL_BLOCK  DataAccess;
+CUnit     FUNCTIONAL_BLOCK  CU;
+
+
+" Busses
+ProgramAB  =  [ProgramAB12..ProgramAB0]; "13-bit Program address bus
+ProgramDB  =  [ProgramDB15..ProgramDB0]; "16-bit Program data bus
+DataAB     =  [DataAB7..DataAB0];	"8-bit Data address bus
+DataDB     =  [DataDB7..DataDB0];	"8-bit Data data bus
+
+Accum = [Accum7..Accum0];
+Flags = [Flags7..Flags0];
+PC = PAUnit.[PC12..PC0];
+XReg = [XReg7..XReg0];
+SReg = [SReg7..SReg0];
+
+EQUATIONS
+
+" The inputs to the Control Unit
+CUnit.[ProgramDB15..ProgramDB0] = ProgramDB;
+CUnit.[Flags7..Flags0] = [Flags7..Flags0];
+
+
+" The inputs to the Program Memory Unit
+
+" The offset of the Program Memory Unit is determined by a a select line from
+" the Control Unit. The two possible values for the offset are the input from
+" the Data Data Bus (1) or the low-8 bits of the Instruction Register
+PAUnit.[Offset7..Offset0] = (CUnit.PAUOffsetSel & DataDB) #
+                            (!CUnit.PAUOffsetSel & CUnit.[AUOffset7..AUOffset0]);
+
+" The direct address being fed into the Program Memory Unit is the low 13-bits
+" from the Instruction Register
+PAUnit.[Direct12..Direct0] = CUnit.[AUOffset12..AUOffset0];
+
+" Program Memory Unit control signals
+PAUnit.Load       = CUnit.Load;
+PAUnit.SourceSelA = CUnit.SourceSelA;
+PAUnit.SourceSelB = CUnit.SourceSelB;
+PAUnit.SourceSelC = CUnit.SourceSelC;
+PAUnit.HoldPC     = CUnit.HoldPC;
+
+
+" The inputs to the Data Memory Unit
+
+" Feed accumulator into accumulator input for the Data Memory Unit
+DAUnit.[Accum7..Accum0] = [Accum7..Accum0];
+
+" The offset input to the Data Memory Unit is the low 8-bits from the Instruction
+" Register in the Control Unit
+DAUnit.[Offset7..Offset0] = CUnit.[AUOffset7..AUOffset0];
+
+" Data Memory Unit control signals
+DAUnit.IDSel        = CUnit.IDSel;
+DAUnit.IDEn         = CUnit.IDEn;
+DAUnit.PrePostSel   = CUnit.PrePostSel;
+DAUnit.AddrSrcSelA  = CUnit.AddrSrcSelA;
+DAUnit.AddrSrcSelB  = CUnit.AddrSrcSelB;
+DAUnit.OffsetSrcSel = CUnit.OffsetSrcSel;
+DAUnit.UpdateX      = CUnit.UpdateX;
+DAUnit.UpdateS      = CUnit.UpdateS;
+
+
+" The inputs to the Arithmetic Logic Unit
+
+" The data line into the Arithmetic Logic Unit is determined with a 4:1 mux with
+" its select lines from the Control Unit. The possible values are the Data Data
+" Bus (11), the low 8-bits of the Instruction Register (10), the X-Register (01),
+" or the S-Register (00)
+ALUnit.[Data7..Data0] = (CUnit.DDBSelA & CUnit.DDBSelB & DataDB) #
+                        (CUnit.DDBSelA & !CUnit.DDBSelB &
+                         CUnit.[AUOffset7..AUOffset0]) #
+                        (!CUnit.DDBSelA & CUnit.DDBSelB & [XReg7..XReg0]) #
+                        (!CUnit.DDBSelA & !CUnit.DDBSelB & [SReg7..SReg0]);
+
+" Arithmetic Logic Unit control signals
+ALUnit.SRHighSelC   = 0;    " the SR control signals are unused since I have not
+ALUnit.SRHighSelB   = 0;    " implemented the shifter/rotater functions for
+ALUnit.SRHighSelA   = 0;    " extra credit
+ALUnit.SRMidSel     = 0;
+ALUnit.SRLowSelB    = 0;
+ALUnit.SRLowSelA    = 0;
+ALUnit.UpdateAcc    = CUnit.UpdateAcc;
+ALUnit.SelectBlock  = CUnit.SelectBlock;
+ALUnit.[F3..F0]     = CUnit.[F3..F0];
+ALUnit.UseAdder     = CUnit.UseAdder;
+ALUnit.CarryInA     = CUnit.CarryInA;
+ALUnit.CarryInB     = CUnit.CarryInB;
+ALUnit.SZFlags      = CUnit.SZFlags;
+ALUnit.VCFlags      = CUnit.VCFlags;
+ALUnit.InvertCarry  = CUnit.InvertC;
+ALUnit.PopF         = CUnit.PopF;
+
+
+" Reset signal for the modules
+CUnit.Reset     = Reset;
+PAUnit.Reset    = Reset;
+DAUnit.Reset    = Reset;
+ALUnit.Reset    = Reset;
+
+" Clock signal for the modules
+CUnit.Clock     = Clock;
+PAUnit.Clock    = Clock;
+DAUnit.Clock    = Clock;
+ALUnit.Clock    = Clock;
+
+
+
+" Outputs
+Accum = ALUnit.[Accum7..Accum0];    " update accumulator from ALU
+
+" Flags will be the value given by the ALU flags
+" Flags6 and Flags4 are unused so they must be off when writing
+Flags = ALUnit.[Flags7, Flags6 & !WR, Flags5, Flags4 & !WR, Flags3..Flags0];
+
+" Output Data Address Bus from the Data Memory Unit
+DataAB = DAUnit.[DataAddr7..DataAddr0];
+
+" Output Program Address Bus from Program Memory Unit
+ProgramAB = PAUnit.[ProgAddr12..ProgAddr0];
+
+" Output Data Data Bus with a 4:1 mux. The select lines for the mux come from
+" the control unit. The output of the mux is the accumulator (11), the ALU
+" flags (10), the high 5-bits of the program counter converted to 8-bits (01),
+" or the low 8-bits of the program counter (00)
+" The outputs involving the PC are not implemented yet in this assigment since
+" they will be used only for CALL or RTS
+DataDB = (CUnit.DDBSelA & CUnit.DDBSelB & [Accum7..Accum0]) #
+         (CUnit.DDBSelA & !CUnit.DDBSelB & [Flags7..Flags0]) #
+         (!CUnit.DDBSelA & CUnit.DDBSelB & [0, 0, 0, PAUnit.PC12, PAUnit.PC11,
+          PAUnit.PC10, PAUnit.PC9, PAUnit.PC8]) #
+         (!CUnit.DDBSelA & !CUnit.DDBSelB & PAUnit.[PC7..PC0]);
+
+" Output the X and S registers from the Data Memory Unit
+XReg = DAUnit.[XReg7..XReg0];
+SReg = DAUnit.[SReg7..SReg0];
+
+" Output Read, Write, and IO signals from the Control Unit
+RD = CUnit.RD & !Clock;   " read signal cannot be high when clock is high
+WR = CUnit.WR & !Clock;   " write signal cannot be high whene clock is high
+IO = CUnit.IO;            " not implemented; used for debugging
+
+
+" output enables
+
+" Data data bus is enabled when writing
+DataDB.OE  =  WR;
+
+" most signals are always enabled
+ProgramAB.OE         =  ^h1FFF;
+DataAB.OE            =  ^hFF;
+RD.OE                =  1;
+WR.OE                =  1;
+IO.OE                =  1;
+[Accum7..Accum0].OE  =  ^hFF;
+[Flags7..Flags0].OE  =  ^hFF;
+[XReg7..XReg0].OE    =  ^hFF;
+[SReg7..SReg0].OE    =  ^hFF;
+
+END  CPU

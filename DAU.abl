@@ -1,0 +1,176 @@
+MODULE DataAccess
+TITLE 'Data Access Unit'
+
+DataAccess INTERFACE  (Accum7..Accum0, Offset7..Offset0,
+                       IDSel, IDEn, PrePostSel, AddrSrcSelA, AddrSrcSelB,
+                       OffsetSrcSel, UpdateX, UpdateS,
+                       Reset, Clock
+                       -> DataAddr7..DataAddr0, XReg7..XReg0, SReg7..SReg0);
+
+
+" Description:
+" The Data Memory Access Unit consists of the X and S registers (8-bits each),
+" the logic for genrerating data addresses, and the logic for updating the X and
+" S registers when doing pre and post increment/decrement insturction. The inputs
+" to the units are an 8-bit offset, the 8-bit accumulator, and control lines from
+" the Control Unit. The outputs of the unit are the Data Address Bus (8-bits), the
+" X register (8-bits) and the S register (8-bits).
+"
+" Inputs:         Accum7..Accum 0   - 8-bit accumulator
+"                 Offset7..Offset0  - 8-bit offset
+"                 IDSel             - add 1 to address source (1) or subtract
+"                                     1 from address source (0)
+"                 IDEn              - enable the incrementer/decrement to
+"                                     work (1) or pass value through(0)
+"                 PrePostSel        - pre (0) or post (1)
+"                 AddrSrcSelA       - select lines for address source to
+"                                     incrementer/decrementer
+"                 AddrSrcSelB       - S-register(10), X-register(01), or zero(00)
+"                 OffsetSrcSel      - second operand to adder: offset(1) or
+"                                     zero(0)
+"                 UpdateX           - allow X-register to update (1) or not (0)
+"                 UpdateS           - allow S-register to update (1) or not (0)
+"
+"                 Reset             - system reset signal
+"                 Clock             - system clock
+"
+" I/O:            DataDB[7..0]      - the 8-bit data data bus
+"
+" Outputs:        ProgramAB[12..0]  - the 13-bit program address bus
+"                 DataAB[7..0]      - the 8-bit data address bus
+"                 RD                - read signal for the data data bus
+"                 WR                - write signal for the data data bus
+"                 IO                - memory (0) or I/O (1) is being accessed
+"
+" Status Outputs: Accum[7..0]       - the 8-bit accumulator
+"                 Flags[7..0]       - the 8-bit flag register
+"                 XReg[7..0]        - the 8-bit X register
+"                 SReg[7..0]        - the 8-bit S register
+
+
+" Revison History:
+" 03/01/22  Garrett Knuf  Project outline
+" 03/01/22  Garrett Knuf  Write equations
+" 03/01/22  Garrett Knuf  Add control signals and interface
+" 03/02/22  Garrett Knuf  Update X-reg, S-reg, and add control signals
+" 03/02/22  Garrett Knuf  Implement extra credit (enabling inc/dec) and put
+"                         accumulator as an input to the address source mux
+" 03/14/22  Garrett Knuf  Update documentation
+
+
+" Pins/Signal Declarations
+Accum7..Accum0    pin;  " 8-bit accumulator
+Offset7..Offset0  pin;  " 8-bit offset
+
+IDSel         pin;  " select for incrementing (0) or decrementing (1)
+IDEn          pin;  " enable incrementer/decrement (1) or pass value through (0)
+PrePostSel    pin;  " select for post-inc/dec (1) or pre-inc/dec (0)
+AddrSrcSelA   pin;  " select lines for desired address for first operand of adder
+AddrSrcSelB   pin;  " S-register (10), X-register (01), zero (00)
+OffsetSrcSel  pin;  " select for desired offset for second operand of adder
+                    " offset (1) or zero (0)
+UpdateX       pin;  " allow the X register to change (1) or not (0)
+UpdateS       pin;  " allow the S register to change (1) or not (0)
+
+Reset   pin;  " system reset
+Clock   pin;  " system clock
+
+DataAddr7..DataAddr0    pin;                      " Data Address
+XReg7..XReg0            pin   ISTYPE 'REG KEEP';  " X register
+SReg7..SReg0            pin   ISTYPE 'REG KEEP';  " S register
+
+
+" Intermediate Terms
+AddrSrc7..AddrSrc0        node;   " output for mux that selects desired address
+OffsetSrc7..OffsetSrc0    node;   " output for mux that selects desired offset
+
+IDOperand7..IDOperand0      node;   " used for selecting the input to the inc/dec
+IDSum7..IDSum0              node;   " incrementer/decrementer results
+IDCarryOut7..IDCarryOut0    node;   " carry bits for inc/dec arithmetic
+
+Sum7..Sum0             node;    " result of primary adder (address + offset)
+CarryOut7..CarryOut0   node;    " carry bits for primary adder
+
+PrePost7..PrePost0     node;    " result from pre/post mux
+
+
+" Declare Buses
+Accum = [Accum7..Accum0];     " accumulator
+Offset = [Offset7..Offset0];    " offset
+
+DataAddr = [DataAddr7..DataAddr0];    " data address
+XReg = [XReg7..XReg0];    " X register
+SReg = [SReg7..SReg0];    " S register
+
+AddrSrc = [AddrSrc7..AddrSrc0];     " Address Source
+OffsetSrc = [OffsetSrc7..OffsetSrc0];     " Offset Source
+
+IDOperand = [IDOperand7..IDOperand0];   " main operand for inc/dec
+IDSum = [IDSum7..IDSum0];   " inc/dec sum
+IDCarryOut = [IDCarryOut7..IDCarryOut0];    " inc/dec carry-out bits
+IDCarryIn = [IDCarryOut6..IDCarryOut0, 0];   " inc/dec carry-in bits
+
+Sum = [Sum7..Sum0];     " adder result
+CarryOut = [CarryOut7..CarryOut0];    " adder carry-out bits
+CarryIn = [CarryOut6..CarryOut0, 0];    " adder carry-in bits
+
+PrePost = [PrePost7..PrePost0];     "pre/post mux result
+
+
+" Constants
+PLUSONE = [0, 0, 0, 0, 0, 0, 0, 1];    " positive one
+MINUSONE = [1, 1, 1, 1, 1, 1, 1, 1];    " negative one
+
+
+EQUATIONS
+
+" clock all the registers
+XReg.CLK = Clock;
+SReg.CLK = Clock;
+
+" reset all the register
+XReg.CLR = Reset;
+SReg.CLR = Reset;
+
+" 4:1 mux to determine the first operand of the main adder
+"   Possible values: X-register, S-register, accumulator, or zero (omitted)
+AddrSrc = (!AddrSrcSelA & AddrSrcSelB & XReg) #
+          (AddrSrcSelA & !AddrSrcSelB & SReg) #
+          (AddrSrcSelA & AddrSrcSelB & Accum);
+
+" 2:1 mux to determine the second operand of the main adder
+"   Possible values: offset bus (8-bit) and zero (omitted from eq)
+OffsetSrc = OffsetSrcSel & Offset;
+
+" Calculate result from incrementer/decrementer
+" Implemented as an 8-bit adder where the two operands are (1) the address source
+" and (2) either positive one (for increment) or negative one (for decrement)
+IDOperand = (!IDSel & MINUSONE) # (IDSel & PLUSONE); " select +1 or -1 as operand
+
+" result of inc/dec will only be sum of two operands if the inc/dec is enabled
+" otherwise, the input of the inc/dec will address source will be the output
+IDSum = (IDEn & (AddrSrc $ IDOperand $ IDCarryIn)) # (!IDEn & AddrSrc);
+
+" carry-bits for adder of inc/dec
+IDCarryOut = (AddrSrc & IDOperand) # (IDCarryIn & (AddrSrc $ IDOperand));
+
+" Determine whether the address source or the inc/dec result should be passed
+" to the adder as one of the operands
+PrePost = (!PrePostSel & AddrSrc) # (PrePostSel & IDSum);
+
+" Add the output of the pre/post mux and the offset source together (8-bit adder)
+Sum = PrePost $ OffsetSrc $ CarryIn;    " will be output on data address bus
+
+" carry-bit for the adder between the pre/post mux and offset source
+CarryOut = (PrePost & OffsetSrc) # (CarryIn & (PrePost $ OffsetSrc));
+
+" Update the data address bus to be the result of the adder
+DataAddr = Sum;
+
+" Update the X register if enabled
+XReg := (UpdateX & IDSum) # (!UpdateX & XReg);
+
+" Update the S register if enabled
+SReg := (UpdateS & IDSum) # (!UpdateS & SReg);
+
+END DataAccess

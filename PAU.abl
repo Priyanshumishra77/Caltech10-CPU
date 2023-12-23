@@ -1,0 +1,125 @@
+MODULE ProgramAccess
+TITLE 'Program Address Unit'
+
+ProgramAccess INTERFACE (Offset7..Offset0, Direct12..Direct0,
+               			 Load, SourceSelA, SourceSelB, SourceSelC, HoldPC,
+               			 Reset, Clock
+               			 -> ProgAddr12..ProgAddr0, PC12..PC0);
+
+
+" Description:
+" This is the Program Memory Access Unit implemented for Homework #7 for EE/CS10b.
+"
+" The Program Memory Access Unit consists of the Program Counter (PC) and the
+" logic for updating the PC. The inputs are an 8-bit unsigned offset, a 13-bit
+" direct address, the internal data bus (for RTS instructions), and appropriate
+" control lines from the Control Unit. The output of the unit is the Program
+" Address Bus (13-bits) and Program Counter (13-bits).
+"
+" Inputs:     Offset7..Offset0  - 8-bit offset to be added to the PC
+"             Direct12..Direct0 - 13-bit direct address for direct jumps
+"             SourceSelA        - select the second operand of the adder: 
+"             SourceSelB          high-five bits of offset padded with 8 zeros 
+"             SourceSelC          (111), non sign-extended 13-bit offset (011), 
+"                                 direct line (010), sign-extended 13-bit offset
+"                                 (001), one (000)
+"             HoldPC            - prevent the program counter from changing (1)
+"                                 or allow it (0)
+"             Reset             - system reset pin
+"             Clock             - system clock pin
+"
+" Outputs:    ProgAddr12..ProgAddr0   - the address to outputted to the program
+"                                       address bus
+"             PC12..PC10              - the 13-bit program counter
+
+" Revision History:
+" 2/23/22  Garrett Knuf    Initial revision
+" 2/24/22  Garrett Knuf    Reconfigure control signals
+" 2/24/22  Garrett Knuf    Fix operands for the RTS instruction
+" 2/25/22  Garrett Knuf	   Fix interface and update comments
+" 3/14/22  Garrett Knuf    Update documentation
+
+
+" Pins/Signal Declarations
+
+Offset7..Offset0       pin;		" address offset from the PC
+Direct12..Direct0      pin;		" direct addressing
+OffsetEx12..OffsetEx0  pin;		" extended offset from 8-bit to 13-bit
+Reset                  pin;
+Clock                  pin;
+
+Load        pin;  " loads PC into first operand of adder (active low)
+SourceSelA  pin;  " select the second operand of the adder: high-five bits of
+SourceSelB  pin;  " offset padded with 8 zeros (111), non sign-extended 13-bit
+SourceSelC  pin;  " offset (011), direct line (010), sign-extended 13-bit offset
+                  " (001), one (000)
+HoldPC      pin;  " does not let program counter change value (active high)
+
+ProgAddr12..ProgAddr0   pin;
+PC12..PC0               pin		ISTYPE 'REG KEEP';	" Program Counter
+
+
+" Intermediate Terms
+CarryIn12..CarryIn1     node;
+CarryOut12..CarryOut0   node;
+Source12..Source0       node;
+Sum12..Sum0             node;
+
+
+
+" Declare Buses
+Direct      =  [Direct12..Direct0];
+ProgAddr    =  [ProgAddr12..ProgAddr0];
+PC          =  [PC12..PC0];
+
+Sum = [Sum12..Sum0];		" result of adder
+
+" Carry-out for the nth-bit is carry-in for the (n+1)th-bit
+CarryOut    =  [CarryOut12..CarryOut0];
+CarryIn     =  [CarryOut11..CarryOut0, 0];
+
+" Sign-extend the offset from 8-bits to 13-bits
+OffsetEx  =  [Offset7, Offset7, Offset7, Offset7, Offset7, Offset7..Offset0];
+
+" Operands for the RTS instructions that feed into mux for second operand
+RTSLowOp  =  [0, 0, 0, 0, 0, Offset7..Offset0];
+RTSHighOp  =  [Offset4..Offset0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+" Result from 5:1 mux to determine second operand of adder
+Source = [Source12..Source0];
+
+
+" CONSTANTS
+ONE = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+ZERO = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+
+EQUATIONS
+
+" Clocks for the outputs
+PC.CLK        =  Clock;
+
+" Reset registers
+PC.CLR = Reset;
+
+" Determine the second operand the of adder via 5:1 mux
+" 	Possible values are one, offset, direct, rts low, or rts high)
+Source  =  (!SourceSelA & !SourceSelB & !SourceSelC & ONE) #
+           (!SourceSelA & !SourceSelB & SourceSelC & OffsetEx) #
+           (!SourceSelA & SourceSelB & !SourceSelC & Direct) #
+           (!SourceSelA & SourceSelB & SourceSelC & RTSLowOp) #
+           (SourceSelA & !SourceSelB & !SourceSelC & RTSHighOp) #
+           (SourceSelA & SourceSelB & SourceSelC & ZERO);
+
+" Adder Equations (ProgAddr is the output of Sum)
+Sum  =  (PC & !Load) $ Source $ CarryIn;
+CarryOut  =  ((PC & !Load) & Source) # (CarryIn & ((PC & !Load) $ Source));
+
+" Update the Program Counter only if permissible
+PC  :=  (!HoldPC & Sum) # (HoldPC & PC);
+
+" The program address bus will the outputted based on the value of the PC
+ProgAddr = PC;
+
+
+END ProgramAccess

@@ -1,0 +1,4200 @@
+MODULE CU
+TITLE 'Control Unit (CU)'
+
+CU INTERFACE (ProgramDB15..ProgramDB0, Flags7..Flags0, Reset, Clock
+                 -> UpdateAcc, SelectBlock, F3..F0, UseAdder, CarryInA, CarryInB,
+                 SZFlags, VCFlags, InvertC, PopF, Load, SourceSelA, SourceSelB,
+                 SourceSelC, HoldPC, IDSel, IDEn, PrePostSel, AddrSrcSelA,
+                 AddrSrcSelB, OffsetSrcSel, UpdateX, UpdateS, PAUOffsetSel,
+                 DDBSelA, DDBSelB, RD, WR, IO, AUOffset12..AUOffset0);
+
+" Description:
+" This module implements the Control Unit for the Caltech10 CPU. It consists of
+" the Instruction Register (16-bits) and the logic for genrerating the control
+" signals that connect to the external system circuitry.
+"
+" Inputs:     ProgramDB[15..0]  - the 16-bit program data bus
+"             Flags[7..0]       - the status register from the ALU
+"
+" Outputs:    UpdateAcc         - allows accum to change (1) or not (0)
+"             SelectBlock       - outputs adder result (1) or shift/rot result (0)
+"             F3..F0            - inputs to F-block of adder
+"             UseAdder          - passes accum as operand to adder (1) or zero (0)
+"             CarryInA          - select lines for carry-in on the low-bit
+"                                 of adder
+"             CarryInB          - one (11), carry flag (10), not carry flag (01),
+"                                 zero (00)
+"             SZFlags           - allows sign and zero flags to change (1) or
+"                                 not (0)
+"             VCFlags           - allows overfglow and carry flags to change (1)
+"                                 or not (0)
+"             InvertC           - nots the carry flags (1) or stays the same (0)
+"             PopF              - executing PopF instruction (1) or not (0)
+"             Load              - load PC into PAU Adder (0) or not (1)
+"             SourceSelA        - select the second operand of the adder: high
+"             SourceSelB        - -five bits of offset padded with 8 zeros (111),
+"
+"             SourceSelC        - non sign-extended 13-bit offset (011), direct
+"                                 line(010), sign-extended 13-bit offset(001),
+"                                 one(000)
+"             HoldPC            - prevent the program counter from changing (1)
+"                                 or allow it (0)
+"             IDSel             - add 1 to address source (1) or subtract 1 from
+"                                 address source (0)
+"             IDEn              - enable the incrementer/decrement to work (1) or
+"                                 pass value through(0)
+"             PrePostSel        - pre (0) or post (1)
+"             AddrSrcSelA       - select lines for address source to incrementer/
+"             AddrSrcSelB       - decrementer S-register (10), X-register (01),
+"                                 or zero (00)
+"             OffsetSrcSel      - second operand to adder: offset (1) or zero(0)
+"             UpdateX           - allow X-register to update (1) or not (0)
+"             UpdateS           - allow S-register to update (1) or not (0)
+"             DDBSelA           - the select lines for the 4:1 mux determining
+"             DDBSelB             the data line input for the ALU: DDB (11),
+"                                 low 8-bits of IR (10), X-Register (01), or
+"                                 S-Register (00); alternatively determines the
+"                                 output of the DDB: accumulator (11), flags(10),
+"                                 high 5-bits of PC (01), or low 5-bits of PC(00)
+"             RD                - indicates read enabled (1) or not (0)
+"             WR                - indicates write enabled (1) or not (0)
+"             AUOffset[12..0]   - low 13-bits of the IR for use the address units
+
+" Revision History:
+" 03/08/22  Garrett Knuf    Module Outline
+" 03/09/22  Garrett Knuf    Implement control signal equations for ALU and PAU
+" 03/10/22  Garrett Knuf    Modify control signals
+" 03/11/22  Garrett Knuf    Make sure the instruction register was clocked
+" 03/12/22  Garrett Knuf    Debug control signals related to DAB
+" 03/13/22  Garrett Knuf    Debug control signals, including PopF, PushF, and NOP
+" 03/14/22  Garrett Knuf    Debug control signals and logic for conditional jumps
+" 03/14/22  Garrett Knuf    Implement finite state machine for CALL and RTS
+" 03/15/22  Garrett Knuf    Outline finite state machine (FSM)
+" 03/16/22  Garrett Knuf    Adjust structure of FSM and modify control signals
+" 03/17/22  Garrett Knuf    Fix bug with RTS control signals
+
+
+" Pins/Signal Declarations
+
+ProgramDB15..ProgramDB0   pin;  " program data bus
+Flags7..Flags0            pin;  " flags output from ALU
+
+IR15..IR0     pin  ISTYPE 'REG';  " instruction register
+
+CallBit1..CallBit0    pin ISTYPE 'REG';   " state bits for CALL instruction
+RTSBit1..RTSBit0      pin ISTYPE 'REG';   " state bits for RTS instruction
+
+Reset   pin;  " system reset
+Clock   pin;  " system clock
+
+
+" ALU Control Signals
+UpdateAcc     pin;  " update accumulator (1) or do not update (0)
+SelectBlock   pin;  " select output to accumulator: adder (1) or shift/rot (0)
+F3..F0        pin;  " four operands into the F-block for logicals ops
+UseAdder      pin;  " determines if the first opperand of adder is accum (1)
+                    " or zero(0)
+CarryInA      pin;  " select lines for carry-in on the low-bit of adder
+CarryInB      pin;  " one (11), carry flag (10), not carry flag (01), zero (00)
+SZFlags       pin;  " update sign and zero flags (1) or not (0)
+VCFlags       pin;  " update overflow and carry flags (1) or not (0)
+InvertC       pin;  " invert the carry flag (1) or not (0)
+PopF          pin;  " performing PopF instruction (1) or not (0)
+
+" PAU Control Signals
+Load          pin;  " load program counter into adder (0) or not (1) active low
+SourceSelA    pin;  " select the second operand of the adder: high-five bits of
+SourceSelB    pin;  " offset padded with 8 zeros (111), non sign-extended 13-bit
+SourceSelC    pin;  " offset (011), direct line (010), sign-extended 13-bit
+                    " offset (001), one (000)
+HoldPC        pin;  " allow the program counter to change (0) or not (1)
+IDSel         pin;  " add 1 to address source (1) or subtract 1 from address
+                    " source (0)
+IDEn          pin;  " enable the incrementer/decrement to work (1) or pass
+                    " value through(0)
+PrePostSel    pin;  " pre (0) or post (1)
+AddrSrcSelA   pin;  " select lines for address source to incrementer/decrementer
+AddrSrcSelB   pin;  " S-register (10), X-register (01), or zero (00)
+OffsetSrcSel  pin;  " second operand to adder: offset (1) or zero (0)
+UpdateX       pin;  " allow X-register to update (1) or not (0)
+UpdateS       pin;  " allow S-register to update (1) or not (0)
+
+" CPU Top-level Control Signals
+PAUOffsetSel  pin;  " selects value going into offset of PAU: DDB (1) or low
+                    " 8-bits of IR (0)
+DDBSelA       pin;  " selects data line into ALU and output of DDB
+DDBSelB       pin;  " Data into ALU: DDB (11), low 8-bits of IR (10), X-Reg(01),
+                    " S-Reg (00); Output of DDB: Accum (11), Flags (10), high
+                    " 5-bits of PC padded with zeros (01), low 8-bits of PC
+RD            pin;  " indicates read enabled (1) or not (0)
+WR            pin;  " indicates write enabled (1) or not (0)
+IO            pin;  " not implemented; used for debugging
+AUOffset12..AUOffset0   pin;  " feeds low 13-bits of IR into address units
+
+
+" Intermediate terms
+HoldIR        pin;
+
+
+" CONSTANTS for Instructions
+
+" Legend:
+"   a: 13-bit absolute program memory address
+"   r: 8-bit signed program memory address offset
+"   k: 8-bit immediate value
+"   m: 8-bit unsigned data memory address offset
+"   o: 8-bit unsigned data memory address offset
+
+
+" ALU INSTRUCTIONS
+
+" Acc = Acc + 1
+INC    = [0,0,0,0,0,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - (m)
+SUBM   = [0,0,0,1,0,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - (X + o)
+SUBXO  = [0,0,0,1,0,0,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - (S + o)
+SUBSO  = [0,0,0,1,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - k
+SUBI   = [0,0,0,1,0,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - (m) - C
+SBBM   = [0,0,0,1,1,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - (X + o) - C
+SBBXO  = [0,0,0,1,1,0,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - (S + o) - C
+SBBSO  = [0,0,0,1,1,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - k - C
+SBBI   = [0,0,0,1,1,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = -Acc
+NEG    = [0,0,1,0,0,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = NOT Acc
+NOT    = [0,0,1,0,1,1,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc - (m)
+CMPM   = [0,0,1,1,0,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc - (X + o)
+CMPXO  = [0,0,1,1,0,0,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc - (S + o)
+CMPSO  = [0,0,1,1,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc - k
+CMPI   = [0,0,1,1,0,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc XOR (m)
+XORM   = [0,0,1,1,0,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc XOR (X + o)
+XORXO  = [0,0,1,1,0,1,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc XOR (S + o)
+XORSO  = [0,0,1,1,0,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc XOR k
+XORI   = [0,0,1,1,0,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc AND (m)
+ANDM   = [0,1,0,0,0,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc AND (X + o)
+ANDXO  = [0,1,0,0,0,1,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc AND (S + o)
+ANDSO  = [0,1,0,0,0,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc AND k
+ANDI   = [0,1,0,0,0,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc AND (m)
+TSTM   = [0,1,0,0,1,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc AND (X + o)
+TSTXO  = [0,1,0,0,1,1,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc AND (S + o)
+TSTSO  = [0,1,0,0,1,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc and k
+TSTI   = [0,1,0,0,1,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" rotate left Acc through C
+RLC    = [0,1,0,1,0,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" logical shift left Acc
+LSL    = [0,1,0,1,1,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + (m) + C
+ADCM   = [0,1,1,0,0,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + (X + o) + C
+ADCXO  = [0,1,1,0,0,0,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + (S + o) + C
+ADCSO  = [0,1,1,0,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + k + C
+ADCI   = [0,1,1,0,0,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + (m)
+ADDM   = [0,1,1,0,1,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + (X + o)
+ADDXO  = [0,1,1,0,1,0,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + (S + o)
+ADDSO  = [0,1,1,0,1,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc + k
+ADDI   = [0,1,1,0,1,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc OR (m)
+ORM    = [0,1,1,1,0,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc OR (X + o)
+ORXO   = [0,1,1,1,0,1,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc OR (S + o)
+ORSO   = [0,1,1,1,0,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc OR k
+ORI    = [0,1,1,1,0,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = Acc - 1
+DEC    = [0,1,1,1,1,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+
+" LOAD INSTRUCTIONS
+
+" Acc = k
+LDDM   = [1,0,0,0,0,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" S = S + 1 then Acc = (S + o)
+PISLD  = [1,0,0,0,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" X = X + 1 then Acc = (X + o)
+PIXLD  = [1,0,0,0,0,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = k
+LDIK   = [1,0,0,0,1,0,0,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" S = S - 1 then Acc = (S + o)
+PDSLD  = [1,0,0,0,1,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" X = X - 1 then Acc = (X + o)
+PDXLD  = [1,0,0,0,1,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = (S + o) then S = S + 1
+LDSPI  = [1,0,0,1,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = (S + o)
+LDSO   = [1,0,0,1,0,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = (X + o) then X = X + 1
+LDXPI  = [1,0,0,1,0,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = (X + o)
+LDXO   = [1,0,0,1,0,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = (S + o) then S = S - 1
+LDSPD  = [1,0,0,1,1,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" Acc = (X + o) then X = X - 1
+LDXPD  = [1,0,0,1,1,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+
+" STORE INSTRUCTIONS
+
+" (m) = Acc
+STDM   = [1,0,1,0,0,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" S = S + 1 then (S + o) = Acc
+PISST  = [1,0,1,0,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" X = X + 1 then (X + o) = Acc
+PIXST  = [1,0,1,0,0,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" S = S - 1 then (S + o) = Acc
+PDSST  = [1,0,1,0,1,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" X = X - 1 then (X + o) = Acc
+PDXST  = [1,0,1,0,1,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" (S + o) = Acc then S = S + 1
+STSPI  = [1,0,1,1,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" (S + o) = Acc
+STSO   = [1,0,1,1,0,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" (X + o) = Acc then X = X + 1
+STXPI  = [1,0,1,1,0,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" (X + o) = Acc
+STXO   = [1,0,1,1,0,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" (S + o) = Acc then S = S - 1
+STSPD  = [1,0,1,1,1,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" (X + o) = Acc then X = X - 1
+STXPD  = [1,0,1,1,1,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+
+" JUMP INSTRUCTIONS
+
+" If C = 0 and Z = 0 then PC = PC + r + 1
+JA  = [1,0,0,0,1,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If S = 0 then PC = PC + r + 1
+JNS = [1,0,0,1,1,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If V = 0 then PC = PC + r + 1
+JNV = [1,0,1,0,1,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+"If S != V then PC = PC + r + 1
+JL  = [1,0,1,1,1,0,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If C = 1 or Z = 1 then PC = PC + r + 1
+JBE = [1,0,0,0,1,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If S = 1 then PC = PC + r + 1
+JS  = [1,0,0,1,1,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If V = 1 then PC = PC + r + 1
+JV  = [1,0,1,0,1,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If S = V then PC = PC + r + 1
+JGE = [1,0,1,1,1,0,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If C = 0 then PC = PC + r + 1
+JNC = [1,0,0,0,1,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If Z = 0 then PC = PC + r + 1
+JNZ = [1,0,0,1,1,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If S != V or Z = 1 then PC = PC + r + 1
+JLE = [1,0,1,0,1,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If U = 0 then PC = PC + r + 1
+JNU = [1,0,1,1,1,1,0,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If C = 1 then PC = PC + r + 1
+JC  = [1,0,0,0,1,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If Z = 1 then PC = PC + r + 1
+JZ  = [1,0,0,1,1,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If S = V  and Z = 0 then PC = PC + r + 1
+JG  = [1,0,1,0,1,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" If U = 1 then PC = PC + r + 1
+JU  = [1,0,1,1,1,1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" PC = a
+JMP = [1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+
+" MISCELLANEOUS INSTRUCTIONS
+
+" No operation
+NOP   = [0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0];
+
+" Flags = S then S = S + 1
+POPF  = [0,0,0,0,0,0,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" S = S - 1 then S = Flags
+PUSHF = [0,0,0,0,1,1,1,0,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" The CALL instruction is a direct subroutine call that executes in 4 clocks
+" S = S - 1; (S) = (PC + 1) 12:8
+" S = S - 1; (S) = (PC + 1) 7:0
+" PC = a
+CALL = [1,1,1,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.,.X.];
+
+" The RTS instruction returns from a subroutine and executes in 3 clocks
+" It returns to the PC popped off of the stack
+" PC 7:0 = (S); S = S + 1
+" PC 12:8 = (S); S = S + 1
+RTS = [0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0];
+
+
+
+
+" Declare Buses
+ProgramDB = [ProgramDB15..ProgramDB0];  " Program Data Bus
+IR        = [IR15..IR0];    " Instruction Register
+StateBits = [CallBit1..CallBit0, RTSBit1..RTSBit0];   "Define State Bits
+
+" Define the states
+" Descriptions of each state are located within the finite state machine
+" Either of the highest 2-bits indicate CALL instruction (active high)
+" Either of the lowest 2-bits indicate RTS instruction (active low)
+Idle      = [0,0,0,0];
+Call1     = [0,1,0,0];
+Call2     = [1,0,0,0];
+Call3     = [1,1,0,0];
+RTS1      = [0,0,0,1];
+RTS2      = [0,0,1,0];
+
+
+
+EQUATIONS
+
+" The Instruction Register should equal the Program Data Bus on each clock
+IR.CLK = Clock;
+IR.CLR = Reset;
+IR = (ProgramDB & !HoldIR) # (IR & HoldIR);
+
+HoldIR = ((StateBits == Idle) & ((IR == CALL) # (IR == RTS))) #
+         ((StateBits == Call1) # (StateBits == Call2) # (StateBits == RTS1));
+
+" addressing units will receive the low 13-bits of the instruction register
+[AUOffset12..AUOffset0] = [IR12..IR0];
+
+" Setup clock and reset for state bits since they are DFF
+StateBits.CLK = Clock;
+StateBits.CLR = Reset;
+
+
+" Used for Debugging
+IO = 0;
+
+
+" DESCRIPTIONS FOR EACH INSTRUCTION (INCLUDING CONDITIONS FOR JUMPING) ARE
+" ACCESSIBLE NEXT TO THE CONSTANT FOR THE PROGRAMDB FOR EACH INSTRUCTION ABOVE
+
+
+" Acc = Acc + (M) + C
+WHEN (IR == ADCM) THEN {
+    " ALU: add with carry
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ADCXO) THEN {
+    " ALU: add with carry
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ADCSO) THEN {
+    " ALU: add with carry
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ADCI) THEN {
+    " ALU: add with carry
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == ADDM) THEN {
+    " ALU: add
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ADDXO) THEN {
+    " ALU: add
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ADDSO) THEN {
+    " ALU: add
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ADDI) THEN {
+    " ALU: add
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == ANDM) THEN {
+    " ALU: and
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ANDXO) THEN {
+    " ALU: and
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ANDSO) THEN {
+    " ALU: and
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ANDI) THEN {
+    " ALU: and
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == CMPM) THEN {
+    " ALU: compare
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == CMPXO) THEN {
+    " ALU: compare
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == CMPSO) THEN {
+    " ALU: compare
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == CMPI) THEN {
+    " ALU: compare
+    " DAU: pass k on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == DEC) THEN {
+    " ALU: decrement acc
+    " DAU: not relevant
+    " PAU: increment  PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 1;
+    F1 = 1;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == INC) THEN {
+    " ALU: increment acc
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == LSL) THEN {
+    " ALU: shift bits of acc left
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 1;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == NEG) THEN {
+    " ALU: negate acc
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 0;
+    F1 = 1;
+    F0 = 1;
+    UseAdder = 0;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == NOT) THEN {
+    " ALU: not bits of acc
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 0;
+    F1 = 1;
+    F0 = 1;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == ORM) THEN {
+    " ALU: OR acc
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ORXO) THEN {
+    " ALU: OR acc
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ORSO) THEN {
+    " ALU: OR acc
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == ORI) THEN {
+    " ALU: OR acc
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == RLC) THEN {
+    " ALU: rotate acc left with carry
+    " DAU: not relevant
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 1;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == SBBM) THEN {
+    " ALU: subtract with borrow
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == SBBXO) THEN {
+    " ALU: subtract with borrow
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == SBBSO) THEN {
+    " ALU: subtract with borrow
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == SBBI) THEN {
+    " ALU: subtract with borrow
+    " DAU: pass k on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 0;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == SUBM) THEN {
+    " ALU: subtract
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == SUBXO) THEN {
+    " ALU: subtract
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == SUBSO) THEN {
+    " ALU: subtract
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == SUBI) THEN {
+    " ALU: subtract
+    " DAU: pass k on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 0;
+    F0 = 1;
+    UseAdder = 1;
+    CarryInA = 1;
+    CarryInB = 1;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 1;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == TSTM) THEN {
+    " ALU: AND without updating flags
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == TSTXO) THEN {
+    " ALU: AND without updating flags
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == TSTSO) THEN {
+    " ALU: AND without updating flags
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == TSTI) THEN {
+    " ALU: AND without updating flags
+    " DAU: pass k on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 0;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == XORM) THEN {
+    " ALU: XOR with acc
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == XORXO) THEN {
+    " ALU: XOR with acc
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == XORSO) THEN {
+    " ALU: XOR with acc
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == XORI) THEN {
+    " ALU: XOR with acc
+    " DAU: pass k on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 0;
+    F2 = 1;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == POPF) THEN {
+    " ALU: pass DDB through
+    " DAU: post-increment S
+    " PAU: increment PC
+    " DataDataBus: receiving flags from stack
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 1;
+    VCFlags = 1;
+    InvertC = 0;
+    PopF = 1;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 0;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDDM) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = 0;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == PISLD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-inc S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == PIXLD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-inc X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDIK) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass k on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = 0;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == PDSLD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-dec S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == PDXLD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-inc X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDSPI) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-inc S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDSO) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDXPI) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-inc X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDXO) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDSPD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-dec S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == LDXPD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-dec X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 1;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 1;
+    WR = 0;
+}
+
+WHEN (IR == STDM) THEN {
+    " ALU: nothing relevant
+    " DAU: pass (m) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = 0;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == PISST) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-inc S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == PIXST) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-inc X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == PDSST) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-dec S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == PDXST) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (pre-dec X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == STSPI) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-inc S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == STSO) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == STXPI) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-inc X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 1;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == STXO) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == STSPD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-dec S+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+WHEN (IR == STXPD) THEN {
+    " ALU: pass DDB into acc
+    " DAU: pass (post-dec X+o) on DAB
+    " PAU: increment PC
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = .X.;
+    VCFlags = .X.;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 1;
+    OffsetSrcSel = 1;
+    UpdateX = 1;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 1;
+    RD = 0;
+    WR = 1;
+}
+
+
+WHEN (IR == JA) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if above
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+    WHEN ((Flags3 == 0) & (Flags0 == 0)) THEN {
+      Load = 0;
+      SourceSelA = 0;
+      SourceSelB = 0;
+      SourceSelC = 1;
+      HoldPC = 0;
+    }
+
+    WHEN (!((Flags3 == 0) & (Flags0 == 0))) THEN {
+      Load = 0;
+      SourceSelA = 0;
+      SourceSelB = 0;
+      SourceSelC = 0;
+      HoldPC = 0;
+    }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+
+
+}
+
+WHEN (IR == JNS) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if not zero flag
+      UpdateAcc = 0;
+      SelectBlock = 1;
+      F3 = .X.;
+      F2 = .X.;
+      F1 = .X.;
+      F0 = .X.;
+      UseAdder = .X.;
+      CarryInA = .X.;
+      CarryInB = .X.;
+      SZFlags = 0;
+      VCFlags = 0;
+      InvertC = .X.;
+      PopF = 0;
+
+      WHEN (Flags1 != 1) THEN {
+        Load = 0;
+        SourceSelA = 0;
+        SourceSelB = 0;
+        SourceSelC = 1;
+        HoldPC = 0;
+      }
+
+      WHEN (Flags1 == 1) THEN {
+        Load = 0;
+        SourceSelA = 0;
+        SourceSelB = 0;
+        SourceSelC = 0;
+        HoldPC = 0;
+      }
+
+      IDSel = .X.;
+      IDEn = .X.;
+      PrePostSel = 0;
+      AddrSrcSelA = 0;
+      AddrSrcSelB = 0;
+      OffsetSrcSel = 1;
+      UpdateX = 0;
+      UpdateS = 0;
+      PAUOffsetSel = 0;
+      DDBSelA = .X.;
+      DDBSelB = .X.;
+      RD = 0;
+      WR = 0;
+}
+
+WHEN (IR == JNV) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if not overflow flag
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags1 == 0) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+
+  WHEN (Flags1 != 0) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JL) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if less than
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags2 != Flags1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+
+  WHEN (Flags2 == Flags1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JBE) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if below or equal
+      UpdateAcc = 0;
+      SelectBlock = 1;
+      F3 = .X.;
+      F2 = .X.;
+      F1 = .X.;
+      F0 = .X.;
+      UseAdder = .X.;
+      CarryInA = .X.;
+      CarryInB = .X.;
+      SZFlags = 0;
+      VCFlags = 0;
+      InvertC = .X.;
+      PopF = 0;
+
+      WHEN ((Flags3 == 1) # (Flags0 == 1)) THEN {
+        Load = 0;
+        SourceSelA = 0;
+        SourceSelB = 0;
+        SourceSelC = 1;
+        HoldPC = 0;
+      }
+
+      WHEN (!((Flags3 == 1) # (Flags0 == 1))) THEN {
+        Load = 0;
+        SourceSelA = 0;
+        SourceSelB = 0;
+        SourceSelC = 0;
+        HoldPC = 0;
+      }
+
+      IDSel = .X.;
+      IDEn = .X.;
+      PrePostSel = 0;
+      AddrSrcSelA = 0;
+      AddrSrcSelB = 0;
+      OffsetSrcSel = 1;
+      UpdateX = 0;
+      UpdateS = 0;
+      PAUOffsetSel = 0;
+      DDBSelA = .X.;
+      DDBSelB = .X.;
+      RD = 0;
+      WR = 0;
+}
+
+WHEN ((IR == JS) & (Flags1 == 1)) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if sign flag
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+
+  WHEN ((Flags3 == 0) & (Flags0 == 0)) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+
+  WHEN (!((Flags3 == 0) & (Flags0 == 0))) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JV) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if overflow
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags2 == 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+
+  WHEN (Flags2 != 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+  WR = 0;
+}
+
+WHEN (IR == JGE) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if greater than or equal
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags2 == Flags1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+
+  WHEN (Flags2 != Flags1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JNC) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if not carry
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags3 == 0) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+
+  WHEN (Flags3 != 0) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JNZ) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if not zero
+      UpdateAcc = 0;
+      SelectBlock = 1;
+      F3 = .X.;
+      F2 = .X.;
+      F1 = .X.;
+      F0 = .X.;
+      UseAdder = .X.;
+      CarryInA = .X.;
+      CarryInB = .X.;
+      SZFlags = 0;
+      VCFlags = 0;
+      InvertC = .X.;
+      PopF = 0;
+
+      WHEN (Flags0 == 0) THEN {
+        Load = 0;
+        SourceSelA = 0;
+        SourceSelB = 0;
+        SourceSelC = 1;
+        HoldPC = 0;
+      }
+      WHEN (Flags0 != 0) THEN {
+        Load = 0;
+        SourceSelA = 0;
+        SourceSelB = 0;
+        SourceSelC = 0;
+        HoldPC = 0;
+      }
+
+
+      IDSel = .X.;
+      IDEn = .X.;
+      PrePostSel = 0;
+      AddrSrcSelA = 0;
+      AddrSrcSelB = 0;
+      OffsetSrcSel = 1;
+      UpdateX = 0;
+      UpdateS = 0;
+      PAUOffsetSel = 0;
+      DDBSelA = .X.;
+      DDBSelB = .X.;
+      RD = 0;
+      WR = 0;
+}
+
+WHEN (IR == JLE) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if less than or equal
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN ((Flags2 != Flags1) # (Flags0 == 1)) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+  WHEN (!((Flags2 != Flags1) # (Flags0 == 1))) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JNU) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if U-bit clear
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags5 == 0) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+  WHEN (Flags5 != 0) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JC) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if carry
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags3 == 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+  WHEN (Flags3 != 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JZ) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if zero flag
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags0 == 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+  WHEN (Flags0 != 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JG) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if greater than
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN ((Flags2 == Flags1) & (Flags0 == 0)) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+  WHEN (!((Flags2 == Flags1) & (Flags0 == 0))) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JU) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to (PC + r + 1) if U-bit
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+
+  WHEN (Flags5 == 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 1;
+    HoldPC = 0;
+  }
+  WHEN (Flags5 != 1) THEN {
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+  }
+
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 0;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == JMP) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: jump to a
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 1;
+    SourceSelA = 0;
+    SourceSelB = 1;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = 0;
+    AddrSrcSelA = 0;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 1;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = 1;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == NOP) THEN {
+    " ALU: not relevant
+    " DAU: not relevant
+    " PAU: increment
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = .X.;
+    F2 = .X.;
+    F1 = .X.;
+    F0 = .X.;
+    UseAdder = .X.;
+    CarryInA = .X.;
+    CarryInB = .X.;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = .X.;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = .X.;
+    IDEn = .X.;
+    PrePostSel = .X.;
+    AddrSrcSelA = .X.;
+    AddrSrcSelB = .X.;
+    OffsetSrcSel = .X.;
+    UpdateX = 0;
+    UpdateS = 0;
+    PAUOffsetSel = .X.;
+    DDBSelA = .X.;
+    DDBSelB = .X.;
+    RD = 0;
+    WR = 0;
+}
+
+WHEN (IR == PUSHF) THEN {
+    " ALU: not relevant
+    " DAU: pass (pre-decrement S) to DAB
+    " PAU: increment PC
+    " DataDataBus: output flags from ALU
+    UpdateAcc = 0;
+    SelectBlock = 1;
+    F3 = 1;
+    F2 = 0;
+    F1 = 1;
+    F0 = 0;
+    UseAdder = 0;
+    CarryInA = 0;
+    CarryInB = 0;
+    SZFlags = 0;
+    VCFlags = 0;
+    InvertC = 0;
+    PopF = 0;
+    Load = 0;
+    SourceSelA = 0;
+    SourceSelB = 0;
+    SourceSelC = 0;
+    HoldPC = 0;
+    IDSel = 0;
+    IDEn = 1;
+    PrePostSel = 1;
+    AddrSrcSelA = 1;
+    AddrSrcSelB = 0;
+    OffsetSrcSel = 0;
+    UpdateX = 0;
+    UpdateS = 1;
+    PAUOffsetSel = .X.;
+    DDBSelA = 1;
+    DDBSelB = 0;
+    RD = 0;
+    WR = 1;
+}
+
+
+
+
+" INSTRUCTIONS FOR FINITE STATE MACHINE
+
+
+" When transitioning from Idle state to to Call 1...
+
+WHEN ((IR == CALL) & (StateBits == Idle)) THEN {
+
+  " Do nothing with ALU
+  UpdateAcc = 0;
+  SelectBlock = 1;
+  F3 = .X.;
+  F2 = .X.;
+  F1 = .X.;
+  F0 = .X.;
+  UseAdder = .X.;
+  CarryInA = .X.;
+  CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+  InvertC = .X.;
+  PopF = 0;
+
+  " Hold the PC
+  Load = 0;
+  SourceSelA = 1;
+  SourceSelB = 1;
+  SourceSelC = 1;
+  HoldPC = 1;
+
+  " Output the S-register
+  IDSel = 0;
+  IDEn = 0;
+  PrePostSel = 0;
+  AddrSrcSelA = 1;
+  AddrSrcSelB = 0;
+  OffsetSrcSel = 0;
+  UpdateX = 0;
+  UpdateS = 0;
+
+  " Input DataDB into the PAU
+  PAUOffsetSel = 1;
+
+  " Not important
+  DDBSelA = 0;
+  DDBSelB = 1;
+
+  " Neither read nor write
+  RD = 0;
+  WR = 0;
+
+}
+
+
+" In the Call1 state...
+
+WHEN (StateBits == Call1) THEN {
+
+  " do nothing with ALU
+  UpdateAcc = 0;
+  SelectBlock = 1;
+  F3 = .X.;
+  F2 = .X.;
+  F1 = .X.;
+  F0 = .X.;
+  UseAdder = .X.;
+  CarryInA = .X.;
+  CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+  InvertC = .X.;
+  PopF = 0;
+
+  " Hold the PC
+  Load = 0;
+  SourceSelA = 1;
+  SourceSelB = 1;
+  SourceSelC = 1;
+  HoldPC = 1;
+
+  " Pre-decrement the S-register
+  IDSel = 0;
+  IDEn = 1;
+  PrePostSel = 1;
+  AddrSrcSelA = 1;
+  AddrSrcSelB = 0;
+  OffsetSrcSel = 0;
+  UpdateX = 0;
+  UpdateS = 1;
+
+  " Feed data DB in the PAU
+  PAUOffsetSel = 1;
+
+  " Output high5-bits of the PC (12:8)
+  DDBSelA = 0;
+  DDBSelB = 1;
+
+  " Write to memory at (S)
+  RD = 0;
+  WR = 1;
+
+}
+
+
+" In the Call2 state...
+
+WHEN (StateBits == Call2) THEN {
+
+  " do nothing with ALU
+  UpdateAcc = 0;
+  SelectBlock = 1;
+  F3 = .X.;
+  F2 = .X.;
+  F1 = .X.;
+  F0 = .X.;
+  UseAdder = .X.;
+  CarryInA = .X.;
+  CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+  InvertC = .X.;
+  PopF = 0;
+
+  " Jump to the 13-bit address of the IR
+  Load = 1;
+  SourceSelA = 0;
+  SourceSelB = 1;
+  SourceSelC = 0;
+  HoldPC = 0;
+
+  " Pre-decrement S
+  IDSel = 0;
+  IDEn = 1;
+  PrePostSel = 1;
+  AddrSrcSelA = 1;
+  AddrSrcSelB = 0;
+  OffsetSrcSel = 0;
+  UpdateX = 0;
+  UpdateS = 1;
+
+  "  Data DB to the PAU
+  PAUOffsetSel = 1;
+
+  " Low 8-bits of PC will be put on the Data DB
+  DDBSelA = 0;
+  DDBSelB = 0;
+
+  " Write to memory at (S)
+  RD = 0;
+  WR = 1;
+}
+
+
+" In the Call3 state...
+
+WHEN (StateBits == Call3) THEN {
+  " do nothing with ALU
+  UpdateAcc = 0;
+  SelectBlock = 1;
+  F3 = .X.;
+  F2 = .X.;
+  F1 = .X.;
+  F0 = .X.;
+  UseAdder = .X.;
+  CarryInA = .X.;
+  CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+  InvertC = .X.;
+  PopF = 0;
+
+  " Increment PC normally
+  Load = 0;
+  SourceSelA = 0;
+  SourceSelB = 0;
+  SourceSelC = 0;
+  HoldPC = 0;
+
+  " do nothing, output S
+  IDSel = 0;
+  IDEn = 0;
+  PrePostSel = 0;
+  AddrSrcSelA = 1;
+  AddrSrcSelB = 0;
+  OffsetSrcSel = 0;
+  UpdateX = 0;
+  UpdateS = 0;
+
+  "Not important
+  PAUOffsetSel = 1;
+  DDBSelA = 1;
+  DDBSelB = 1;
+
+  " Neither read nor write
+  RD = 0;
+  WR = 0;
+}
+
+
+" When transitioning from Idle to RTS1...
+
+WHEN ((StateBits == Idle) & (IR == RTS)) THEN {
+  " Do nothing with ALU
+  UpdateAcc = 0;
+  SelectBlock = 1;
+  F3 = .X.;
+  F2 = .X.;
+  F1 = .X.;
+  F0 = .X.;
+  UseAdder = .X.;
+  CarryInA = .X.;
+  CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+  InvertC = .X.;
+  PopF = 0;
+
+  " Update the low 8-bits of the PC 7:0
+  Load = 1;
+  SourceSelA = 0;
+  SourceSelB = 1;
+  SourceSelC = 1;
+  HoldPC = 0;
+
+  " Post-increment S
+  IDSel = 1;
+  IDEn = 1;
+  PrePostSel = 0;
+  AddrSrcSelA = 1;
+  AddrSrcSelB = 0;
+  OffsetSrcSel = 0;
+  UpdateX = 0;
+  UpdateS = 1;
+
+  " Feed DDB into the PAU
+  PAUOffsetSel = 1;
+
+  " Get low 8-bits of the PC from stack
+  DDBSelA = 0;
+  DDBSelB = 0;
+
+  " Read from memory at (S)
+  RD = 1;
+  WR = 0;
+
+}
+
+
+" When in the RTS1 state...
+
+WHEN (StateBits == RTS1) THEN {
+  " Do nothing with ALU
+  UpdateAcc = 0;
+  SelectBlock = 1;
+  F3 = .X.;
+  F2 = .X.;
+  F1 = .X.;
+  F0 = .X.;
+  UseAdder = .X.;
+  CarryInA = .X.;
+  CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+  InvertC = .X.;
+  PopF = 0;
+
+  " Load high5-bits from stack into PC bits 12:8
+  Load = 0;
+  SourceSelA = 1;
+  SourceSelB = 0;
+  SourceSelC = 0;
+  HoldPC = 0;
+
+  " Post-increment S
+  IDSel = 1;
+  IDEn = 1;
+  PrePostSel = 0;
+  AddrSrcSelA = 1;
+  AddrSrcSelB = 0;
+  OffsetSrcSel = 0;
+  UpdateX = 0;
+  UpdateS = 1;
+
+  " Feed DDB into the PAU
+  PAUOffsetSel = 1;
+
+  " read the high 5-bits for the PC at (S)
+  DDBSelA = 0;
+  DDBSelB = 1;
+  RD = 1;
+  WR = 0;
+
+}
+
+
+
+" When in the RTS2 state...
+
+WHEN (StateBits == RTS2) THEN {
+  " Do nothing with ALU
+  UpdateAcc = 0;
+  SelectBlock = 1;
+  F3 = .X.;
+  F2 = .X.;
+  F1 = .X.;
+  F0 = .X.;
+  UseAdder = .X.;
+  CarryInA = .X.;
+  CarryInB = .X.;
+  SZFlags = 0;
+  VCFlags = 0;
+  InvertC = .X.;
+  PopF = 0;
+
+  " Increment PC normally
+  Load = 0;
+  SourceSelA = 0;
+  SourceSelB = 0;
+  SourceSelC = 0;
+  HoldPC = 0;
+
+  " Output S, do not change it
+  IDSel = 0;
+  IDEn = 0;
+  PrePostSel = 0;
+  AddrSrcSelA = 1;
+  AddrSrcSelB = 0;
+  OffsetSrcSel = 0;
+  UpdateX = 0;
+  UpdateS = 0;
+
+  " Not important
+  PAUOffsetSel = 1;
+  DDBSelA = 0;
+  DDBSelB = 1;
+
+  " Neither read nor write
+  RD = 0;
+  WR = 0;
+
+}
+
+
+
+
+STATE_DIAGRAM  StateBits;   " Moore state machine
+
+
+" To run CALL instruction
+"     Idle -> Call1 -> Call2 -> Call3 -> Idle
+
+" To run RTS instruction
+"     Idle -> RTS1 -> RTS2 -> Idle
+
+
+STATE Idle:
+  " Always in Idle state unless a Call or RTS needs to be performed
+  IF      (IR == CALL) THEN  Call1
+  ELSE IF (IR == RTS)  THEN  RTS1
+  ELSE                       Idle;
+
+
+STATE Call1:
+  " S = S - 1; (S) = (PC + 1) 12:8
+  GOTO Call2;
+
+STATE Call2:
+  " S = S - 1; (S) = (PC + 1) 7:0
+  GOTO Call3;
+
+STATE Call3:
+  " PC = a
+  GOTO Idle;
+
+STATE RTS1:
+  " PC 7:0 = (S); S = S + 1
+  GOTO RTS2;
+
+STATE RTS2:
+  " PC 12:8 = (S); S = S + 1
+  GOTO Idle;
+
+
+END CU
